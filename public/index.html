@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Kajaanin bussit</title>
+
+<!-- Kirjastot: Leaflet piirtää kartan, mqtt.js vastaanottaa bussien sijainnit -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&display=swap">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+
+<style>
+  /* Asettelu: koko ruudun kartta, päällä yläpalkki ja linjalista-kortti */
+  :root {
+    --bg: #f3f5f4;
+    --surface: #ffffff;
+    --fg: #17211f;
+    --muted: #5d6b68;
+    --line: #d5dcda;
+    --accent: #0b6e5f;
+    --accent-fg: #ffffff;
+    --ok: #1c8a4a;
+    --warn: #b56a00;
+    --bad: #b3261e;
+    --shadow: 0 2px 10px rgba(20, 40, 36, .18);
+    --display: "Barlow Semi Condensed", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+    --body: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101615;
+      --surface: #1a2221;
+      --fg: #e8eeec;
+      --muted: #9aa8a5;
+      --line: #2f3b39;
+      --accent: #4fc3ae;
+      --accent-fg: #06201c;
+      --ok: #5bd08a;
+      --warn: #f0b04a;
+      --bad: #ff8a80;
+      --shadow: 0 2px 12px rgba(0, 0, 0, .5);
+      color-scheme: dark;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 15px/1.45 var(--body);
+    display: flex; flex-direction: column;
+  }
+  [hidden] { display: none !important; }
+
+  /* Yläpalkki */
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 16px;
+    padding-top: calc(10px + env(safe-area-inset-top, 0px));
+    background: var(--surface); border-bottom: 1px solid var(--line);
+    z-index: 1000;
+  }
+  h1 { font: 700 22px/1 var(--display); margin: 0; letter-spacing: .01em; }
+  .status {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 13px; color: var(--muted); margin-left: auto;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--warn); flex: none; }
+  .status.ok .dot { background: var(--ok); }
+  .status.bad .dot { background: var(--bad); }
+
+  /* Kartta ja sen päällä oleva kortti */
+  main { position: relative; flex: 1; min-height: 0; }
+  #map { position: absolute; inset: 0; background: var(--bg); }
+
+  .panel {
+    position: absolute; top: 12px; left: 12px; z-index: 900;
+    width: min(300px, calc(100% - 24px));
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 10px; box-shadow: var(--shadow);
+  }
+  .panel summary {
+    cursor: pointer; padding: 10px 14px; list-style: none;
+    font: 600 16px/1.2 var(--display);
+    display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  }
+  .panel summary::-webkit-details-marker { display: none; }
+  .panel summary::after { content: "▾"; color: var(--muted); }
+  .panel[open] summary::after { content: "▴"; }
+  .panel summary small { font: 13px var(--body); color: var(--muted); margin-left: auto; }
+  .panel-body { padding: 0 14px 12px; max-height: min(46vh, 380px); overflow-y: auto; }
+  .hint { color: var(--muted); font-size: 13px; margin: 0 0 10px; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font: 600 15px/1 var(--display); font-variant-numeric: tabular-nums;
+    min-width: 40px; padding: 7px 9px; border-radius: 6px;
+    border: 2px solid transparent; cursor: pointer;
+    background: var(--c); color: var(--t);
+    opacity: .5;
+  }
+  .chip.live { opacity: 1; }
+  .chip.selected { border-color: var(--fg); opacity: 1; }
+  .chip:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .selected-info { margin: 10px 0 0; font-size: 13px; }
+  .linkbtn {
+    background: none; border: 0; padding: 0; color: var(--accent);
+    font: inherit; cursor: pointer; text-decoration: underline;
+  }
+
+  /* Bussimerkki kartalla */
+  .bus-icon { background: none; border: 0; }
+  .bus {
+    position: relative; width: 30px; height: 30px; border-radius: 50%;
+    background: var(--c); color: var(--t);
+    border: 2px solid #fff; box-shadow: 0 1px 5px rgba(0, 0, 0, .45);
+    display: grid; place-items: center;
+    font: 700 13px/1 var(--display); font-variant-numeric: tabular-nums;
+  }
+  .bus-dir { position: absolute; inset: -9px; pointer-events: none; }
+  .bus-dir::before {            /* pieni nuoli, joka näyttää ajosuunnan */
+    content: ""; position: absolute; top: 0; left: 50%; margin-left: -5px;
+    border: 5px solid transparent; border-top: 0; border-bottom: 8px solid var(--c);
+  }
+  .bus.dim { opacity: .2; }
+  /* Bussit liukuvat uuteen sijaintiin; ei zoomauksen aikana */
+  .leaflet-container:not(.zooming) .bus-icon { transition: transform 1.2s linear; }
+  @media (prefers-reduced-motion: reduce) {
+    .leaflet-container:not(.zooming) .bus-icon { transition: none; }
+  }
+
+  /* Ponnahdusikkunat */
+  .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: var(--surface); color: var(--fg); }
+  .leaflet-popup-content { margin: 12px 14px; font: 14px/1.4 var(--body); min-width: 190px; }
+  .pop-title { font: 700 18px/1.15 var(--display); margin: 0 0 6px; }
+  .pop-row { margin: 2px 0; }
+  .pop-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+  .pop-time { font: 700 20px/1.2 var(--display); font-variant-numeric: tabular-nums; }
+  .late { color: var(--bad); } .early { color: var(--warn); } .ontime { color: var(--ok); }
+  .muted { color: var(--muted); font-size: 13px; }
+  .arrivals { list-style: none; margin: 6px 0 0; padding: 0; }
+  .arrivals li { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; border-top: 1px solid var(--line); }
+  .arrivals .n { font: 700 15px var(--display); min-width: 30px; }
+  .arrivals .h { flex: 1; min-width: 0; }
+  .arrivals .t { font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+  .toast {
+    position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%);
+    z-index: 900; max-width: calc(100% - 32px);
+    background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+    padding: 9px 14px; box-shadow: var(--shadow); font-size: 14px; text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Kajaanin bussit</h1>
+  <div class="status" id="status"><span class="dot"></span><span id="statusText">Odottaa avainta</span></div>
+</header>
+
+<main>
+  <div id="map"></div>
+
+  <details class="panel" id="panel" open>
+    <summary>Linjat <small id="lineCount"></small></summary>
+    <div class="panel-body">
+      <p class="hint">Valitse linja, niin kartalla näkyy vain sen reitti ja bussit. Kirkkaina näkyvillä linjoilla on bussi liikkeellä.</p>
+      <div class="chips" id="chips"></div>
+      <p class="selected-info" id="selectedInfo" hidden></p>
+    </div>
+  </details>
+
+  <div class="toast" id="toast" hidden></div>
+</main>
+
+<script>
+// ===================== ASETUKSET =====================
+const FEED = 'Kajaani';                                   // Kajaanin tunnus Digitransitissa
+const API_URL = '/api/graphql';                          // oma välityspalvelin, joka lisää API-avaimen
+const MQTT_URL = 'wss://mqtt.digitransit.fi';             // bussien reaaliaikaiset sijainnit
+const CENTER = [64.2245, 27.7283];                        // Kajaanin keskusta
+const STALE_SECONDS = 120;                                // bussi poistetaan, jos se on ollut näin kauan hiljaa
+const STOPS_MIN_ZOOM = 14;                                // pysäkit näkyvät vasta lähelle zoomattaessa
+const PALETTE = ['#0b6e5f', '#b4451f', '#2b59c3', '#8a3ea8', '#a17a00', '#c2255c',
+                 '#1f7a8c', '#5a6b1c', '#7048e8', '#b02a37', '#3f6f3a', '#935116'];
+
+// ===================== TILA =====================
+let map, mqttClient, stopsLayer, linesLayer, busLayer;
+const routes = new Map();     // linjan tunnus (esim. "Kajaani:4") -> linjan tiedot
+const buses = new Map();      // bussin tunnus -> { marker, tiedot }
+let selectedRoute = null;     // valitun linjan tunnus tai null
+let mqttConnected = false;
+
+const $ = id => document.getElementById(id);
+
+// ===================== APUFUNKTIOT =====================
+// Estää datassa olevia merkkejä rikkomasta sivun HTML:ää
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Valitsee mustan tai valkoisen tekstin taustavärin kirkkauden mukaan
+function textColorFor(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  const lum = 0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255);
+  return lum > 150 ? '#111111' : '#ffffff';
+}
+
+// Linjat järjestykseen: 1, 2, 4, 11, 11A, 111 ...
+function compareNames(a, b) {
+  return a.localeCompare(b, 'fi', { numeric: true });
+}
+
+// "Kajaani:123" -> "123" ja toisin päin
+const stripFeed = id => String(id || '').replace(/^[^:]*:/, '');
+const withFeed = id => (String(id).includes(':') ? id : FEED + ':' + id);
+
+function formatClock(serviceDay, secondsSinceMidnight) {
+  const d = new Date((serviceDay + secondsSinceMidnight) * 1000);
+  return d.toLocaleTimeString('fi-FI', { hour: '2-digit', minute: '2-digit' });
+}
+
+function delayText(delaySeconds) {
+  const min = Math.round(delaySeconds / 60);
+  if (min >= 1) return `<span class="late">${min} min myöhässä</span>`;
+  if (min <= -1) return `<span class="early">${-min} min etuajassa</span>`;
+  return '<span class="ontime">aikataulussa</span>';
+}
+
+function setStatus(kind, text) {
+  $('status').className = 'status ' + kind;
+  $('statusText').textContent = text;
+}
+
+function showToast(text) {
+  $('toast').textContent = text || '';
+  $('toast').hidden = !text;
+}
+
+// Purkaa Googlen "encoded polyline" -muodon koordinaattilistaksi (reittiviivat tulevat tässä muodossa)
+function decodePolyline(str) {
+  const points = [];
+  let i = 0, lat = 0, lon = 0;
+  while (i < str.length) {
+    for (const which of ['lat', 'lon']) {
+      let result = 0, shift = 0, b;
+      do {
+        b = str.charCodeAt(i++) - 63;
+        result |= (b & 0x1f) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+      const delta = (result & 1) ? ~(result >> 1) : (result >> 1);
+      if (which === 'lat') lat += delta; else lon += delta;
+    }
+    points.push([lat / 1e5, lon / 1e5]);
+  }
+  return points;
+}
+
+// ===================== RAJAPINTAKYSELYT (GraphQL) =====================
+async function graphql(query) {
+  const res = await fetch(API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query })
+  });
+  if (res.status === 401 || res.status === 403) throw new Error('KEY');
+  if (!res.ok) throw new Error('Rajapinta vastasi virheellä ' + res.status);
+  const json = await res.json();
+  if (!json.data) throw new Error(json.errors?.[0]?.message || 'Rajapinta ei palauttanut dataa');
+  return json.data;
+}
+
+// Hakee kaikki Kajaanin linjat, niiden reittiviivat ja pysäkit yhdellä kyselyllä
+async function loadRoutes() {
+  const data = await graphql(`{
+    routes(feeds: ["${FEED}"]) {
+      gtfsId shortName longName color
+      patterns {
+        headsign directionId
+        patternGeometry { points }
+        stops { gtfsId name code lat lon }
+      }
+    }
+  }`);
+
+  const list = (data.routes || []).sort((a, b) => compareNames(a.shortName || '', b.shortName || ''));
+  const stops = new Map();
+
+  list.forEach((r, index) => {
+    const color = r.color ? '#' + r.color : PALETTE[index % PALETTE.length];
+    const route = {
+      id: r.gtfsId, shortName: r.shortName || '?', longName: r.longName || '',
+      color, text: textColorFor(color), lines: [], liveCount: 0
+    };
+    for (const p of r.patterns || []) {
+      if (p.patternGeometry?.points) {
+        const line = L.polyline(decodePolyline(p.patternGeometry.points), { color, weight: 3, opacity: 0.6 });
+        line.addTo(linesLayer);
+        route.lines.push(line);
+      }
+      for (const s of p.stops || []) stops.set(s.gtfsId, s);
+    }
+    routes.set(route.id, route);
+  });
+
+  // Pysäkit pieninä pisteinä
+  for (const s of stops.values()) {
+    const m = L.circleMarker([s.lat, s.lon], {
+      radius: 5, weight: 2, color: '#33413e', fillColor: '#ffffff', fillOpacity: 1
+    });
+    m.bindPopup('');
+    m.on('popupopen', () => fillStopPopup(m, s));
+    m.addTo(stopsLayer);
+  }
+
+  renderChips();
+  $('lineCount').textContent = list.length + ' linjaa';
+}
+
+// ===================== LINJALISTA =====================
+function renderChips() {
+  const box = $('chips');
+  box.innerHTML = '';
+  for (const r of routes.values()) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'chip';
+    b.textContent = r.shortName;
+    b.title = r.longName;
+    b.style.setProperty('--c', r.color);
+    b.style.setProperty('--t', r.text);
+    b.addEventListener('click', () => selectRoute(selectedRoute === r.id ? null : r.id));
+    r.chip = b;
+    box.appendChild(b);
+  }
+  updateChipStates();
+}
+
+function updateChipStates() {
+  for (const r of routes.values()) r.liveCount = 0;
+  for (const b of buses.values()) {
+    const r = routes.get(b.routeId);
+    if (r) r.liveCount++;
+  }
+  for (const r of routes.values()) {
+    r.chip?.classList.toggle('live', r.liveCount > 0);
+    r.chip?.classList.toggle('selected', r.id === selectedRoute);
+  }
+}
+
+function selectRoute(id) {
+  selectedRoute = id;
+  for (const r of routes.values()) {
+    const on = !id || r.id === id;
+    for (const line of r.lines) {
+      line.setStyle({ opacity: on ? (id ? 0.9 : 0.6) : 0.07, weight: id && on ? 5 : 3 });
+      if (id && on) line.bringToFront();
+    }
+  }
+  for (const b of buses.values()) styleBus(b);
+  updateChipStates();
+
+  const info = $('selectedInfo');
+  const r = id && routes.get(id);
+  info.hidden = !r;
+  if (r) {
+    info.innerHTML = `<strong>Linja ${esc(r.shortName)}</strong> ${esc(r.longName)}<br>` +
+      `${r.liveCount} ${r.liveCount === 1 ? 'bussi' : 'bussia'} liikkeellä ·<button class="linkbtn" type="button" id="showAll">Näytä kaikki linjat</button>`;
+    $('showAll').addEventListener('click', () => selectRoute(null));
+    const bounds = L.featureGroup(r.lines).getBounds();
+    if (bounds.isValid()) map.fitBounds(bounds, { padding: [40, 40] });
+  }
+}
+
+// ===================== BUSSIEN SIJAINNIT (MQTT) =====================
+// Viestit ovat protobuf-muotoista GTFS Realtime -dataa. Tämä pieni purkaja lukee
+// niistä vain tarvittavat kentät, joten erillistä kirjastoa ei tarvita.
+function readFields(bytes, onField) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let i = 0;
+  const varint = () => {
+    let value = 0, mult = 1, b;
+    do { b = bytes[i++]; value += (b & 0x7f) * mult; mult *= 128; } while (b & 0x80);
+    return value;
+  };
+  while (i < bytes.length) {
+    const tag = varint();
+    const field = Math.floor(tag / 8), type = tag % 8;
+    let value;
+    if (type === 0) value = varint();                                         // kokonaisluku
+    else if (type === 1) { value = view.getFloat64(i, true); i += 8; }        // 64-bittinen luku
+    else if (type === 2) { const len = varint(); value = bytes.subarray(i, i + len); i += len; }  // teksti tai sisäkkäinen viesti
+    else if (type === 5) { value = view.getFloat32(i, true); i += 4; }        // 32-bittinen luku
+    else break;
+    onField(field, value);
+  }
+}
+
+const utf8 = new TextDecoder();
+
+// Palauttaa viestistä bussin sijainnin ja perustiedot
+function decodeVehicleMessage(bytes) {
+  const v = {};
+  readFields(bytes, (f, entity) => {                 // FeedMessage: 2 = entity
+    if (f !== 2) return;
+    readFields(entity, (f2, vehicle) => {            // FeedEntity: 4 = vehicle
+      if (f2 !== 4) return;
+      readFields(vehicle, (f3, val) => {             // VehiclePosition
+        if (f3 === 1) readFields(val, (f4, x) => {   // trip
+          if (f4 === 1) v.tripId = utf8.decode(x);
+          if (f4 === 2) v.startTime = utf8.decode(x);
+          if (f4 === 5) v.routeId = utf8.decode(x);
+          if (f4 === 6) v.directionId = x;
+        });
+        if (f3 === 2) readFields(val, (f4, x) => {   // position
+          if (f4 === 1) v.lat = x;
+          if (f4 === 2) v.lon = x;
+          if (f4 === 3) v.bearing = x;
+          if (f4 === 5) v.speed = x;
+        });
+        if (f3 === 5) v.timestamp = val;
+        if (f3 === 7) v.stopId = utf8.decode(val);
+        if (f3 === 8) readFields(val, (f4, x) => {   // vehicle
+          if (f4 === 1) v.vehicleId = utf8.decode(x);
+          if (f4 === 2) v.label = utf8.decode(x);
+        });
+      });
+    });
+  });
+  return v;
+}
+
+function connectMqtt() {
+  if (mqttClient) mqttClient.end(true);
+  setStatus('', 'Yhdistetään busseihin…');
+
+  mqttClient = mqtt.connect(MQTT_URL, {
+    clientId: 'kajaani-kartta-' + Math.random().toString(16).slice(2, 10),
+    keepalive: 30,
+    reconnectPeriod: 30000      // uusi yritys 30 s välein, jos yhteys katkeaa
+  });
+
+  mqttClient.on('connect', () => {
+    mqttConnected = true;
+    mqttClient.subscribe(`/gtfsrt/vp/${FEED}/#`);
+    updateBusStatus();
+  });
+  mqttClient.on('message', (topic, payload) => {
+    try { handleVehicle(topic, payload); } catch (e) { console.warn('Viestin käsittely epäonnistui', e); }
+  });
+  const lost = () => { mqttConnected = false; setStatus('bad', 'Ei yhteyttä bussien sijainteihin, yritetään uudelleen'); };
+  mqttClient.on('close', lost);
+  mqttClient.on('error', e => { console.warn('MQTT-virhe', e); lost(); });
+}
+
+function handleVehicle(topic, payload) {
+  // Aihe: /gtfsrt/vp/Kajaani/agency/nimi/mode/reitti/suunta/määränpää/lähtö-id/seuraava pysäkki/lähtöaika/ajoneuvo/.../lyhyt nimi/väri/
+  const t = topic.split('/');
+  const v = decodeVehicleMessage(payload);
+  if (typeof v.lat !== 'number' || typeof v.lon !== 'number') return;
+
+  const info = {
+    routeId: withFeed(v.routeId || t[7] || ''),
+    headsign: t[9] || '',
+    tripId: v.tripId || t[10] || '',
+    nextStop: v.stopId || t[11] || '',
+    startTime: v.startTime || t[12] || '',
+    vehicleId: v.vehicleId || t[13] || '',
+    shortName: t[18] || '',
+    lat: v.lat, lon: v.lon, bearing: v.bearing, speed: v.speed,
+    seen: Date.now()
+  };
+  const key = info.vehicleId || info.tripId;
+  if (!key) return;
+
+  let bus = buses.get(key);
+  if (!bus) {
+    const marker = L.marker([info.lat, info.lon], {
+      icon: L.divIcon({ className: 'bus-icon', html: '<div class="bus"><span class="bus-dir"></span><b></b></div>', iconSize: [30, 30], iconAnchor: [15, 15] }),
+      zIndexOffset: 500
+    });
+    marker.bindPopup('', { autoPan: false });
+    bus = { marker };
+    marker.on('popupopen', () => fillBusPopup(bus));
+    marker.addTo(busLayer);
+    buses.set(key, bus);
+  }
+  Object.assign(bus, info);
+  bus.marker.setLatLng([info.lat, info.lon]);
+  styleBus(bus);
+  updateChipStates();
+  updateBusStatus();
+}
+
+// Päivittää bussimerkin värin, numeron ja suuntanuolen
+function styleBus(bus) {
+  const el = bus.marker.getElement()?.querySelector('.bus');
+  if (!el) return;
+  const route = routes.get(bus.routeId);
+  const color = route?.color || '#33413e';
+  el.style.setProperty('--c', color);
+  el.style.setProperty('--t', route?.text || '#ffffff');
+  el.querySelector('b').textContent = route?.shortName || bus.shortName || '?';
+  const dir = el.querySelector('.bus-dir');
+  dir.hidden = typeof bus.bearing !== 'number';
+  if (!dir.hidden) dir.style.transform = `rotate(${bus.bearing}deg)`;
+  el.classList.toggle('dim', !!selectedRoute && bus.routeId !== selectedRoute);
+}
+
+function updateBusStatus() {
+  if (!mqttConnected) return;
+  const n = buses.size;
+  setStatus('ok', n === 0 ? 'Yhdistetty · odotetaan busseja' : `Reaaliaikainen · ${n} ${n === 1 ? 'bussi' : 'bussia'} kartalla`);
+  showToast(n === 0 && emptyHintDue ? 'Yhtään bussia ei näy juuri nyt. Illalla ja yöllä liikennettä ei välttämättä ole.' : '');
+}
+
+// Näytetään vihje vasta, kun busseja on odotettu hetki
+let emptyHintDue = false;
+
+// Poistaa bussit, joista ei ole kuulunut hetkeen (ajo päättynyt tai yhteys poikki)
+function removeStaleBuses() {
+  const limit = Date.now() - STALE_SECONDS * 1000;
+  for (const [key, bus] of buses) {
+    if (bus.seen < limit) { busLayer.removeLayer(bus.marker); buses.delete(key); }
+  }
+  updateChipStates();
+  updateBusStatus();
+}
+
+// ===================== PONNAHDUSIKKUNAT JA ENNUSTEET =====================
+const STOPTIME_FIELDS = `scheduledArrival realtimeArrival arrivalDelay realtime serviceDay headsign
+  trip { gtfsId route { gtfsId shortName } }`;
+
+// Bussin ikkuna: linja, määränpää ja ennuste seuraavalle pysäkille
+async function fillBusPopup(bus) {
+  const route = routes.get(bus.routeId);
+  const title = `<p class="pop-title">Linja ${esc(route?.shortName || bus.shortName || '?')}` +
+    (bus.headsign ? ` → ${esc(bus.headsign)}` : '') + '</p>';
+  const speed = typeof bus.speed === 'number' ? `<p class="muted">Nopeus ${Math.round(bus.speed * 3.6)} km/h</p>` : '';
+
+  if (!bus.nextStop) {
+    bus.marker.setPopupContent(title + '<p class="muted">Seuraavaa pysäkkiä ei ole tiedossa.</p>' + speed);
+    return;
+  }
+  bus.marker.setPopupContent(title + '<p class="muted">Haetaan ennustetta…</p>');
+
+  try {
+    const stopId = withFeed(bus.nextStop);
+    const data = await graphql(`{ stop(id: "${stopId}") { name code
+      stoptimesWithoutPatterns(numberOfDepartures: 40) { ${STOPTIME_FIELDS} } } }`);
+    const stop = data.stop;
+    if (!stop) throw new Error('Pysäkkiä ei löytynyt');
+
+    // Etsitään pysäkin lähdöistä juuri tämän bussin vuoro
+    const times = stop.stoptimesWithoutPatterns || [];
+    const tripId = withFeed(bus.tripId);
+    const hit = times.find(s => s.trip?.gtfsId === tripId) ||
+                times.find(s => s.trip?.route?.gtfsId === bus.routeId);
+
+    let html = title +
+      `<p class="pop-row"><span class="pop-label">Seuraava pysäkki</span><br>${esc(stop.name)}${stop.code ? ' (' + esc(stop.code) + ')' : ''}</p>`;
+    if (hit) {
+      html += `<p class="pop-row"><span class="pop-label">${hit.realtime ? 'Arvioitu saapuminen' : 'Aikataulun mukaan'}</span><br>` +
+        `<span class="pop-time">${formatClock(hit.serviceDay, hit.realtime ? hit.realtimeArrival : hit.scheduledArrival)}</span> ` +
+        (hit.realtime ? delayText(hit.arrivalDelay) : '') + '</p>';
+      if (!hit.realtime) html += '<p class="muted">Tälle vuorolle ei ole reaaliaikaista ennustetta.</p>';
+    } else {
+      html += '<p class="muted">Saapumisaikaa ei löytynyt tälle vuorolle.</p>';
+    }
+    bus.marker.setPopupContent(html + speed);
+  } catch (e) {
+    bus.marker.setPopupContent(title + `<p class="muted">Ennusteen haku epäonnistui: ${esc(e.message === 'KEY' ? 'palvelimen avain ei kelpaa' : e.message)}</p>`);
+  }
+}
+
+// Pysäkin ikkuna: seuraavat saapuvat bussit
+async function fillStopPopup(marker, stop) {
+  const title = `<p class="pop-title">${esc(stop.name)}${stop.code ? ' <span class="muted">' + esc(stop.code) + '</span>' : ''}</p>`;
+  marker.setPopupContent(title + '<p class="muted">Haetaan saapuvia busseja…</p>');
+  try {
+    const data = await graphql(`{ stop(id: "${stop.gtfsId}") {
+      stoptimesWithoutPatterns(numberOfDepartures: 6) { ${STOPTIME_FIELDS} } } }`);
+    const times = data.stop?.stoptimesWithoutPatterns || [];
+    if (!times.length) {
+      marker.setPopupContent(title + '<p class="muted">Ei tulevia busseja lähiaikoina.</p>');
+      return;
+    }
+    const rows = times.map(s => `<li>
+      <span class="n">${esc(s.trip?.route?.shortName || '')}</span>
+      <span class="h">${esc(s.headsign || '')}</span>
+      <span class="t">${formatClock(s.serviceDay, s.realtime ? s.realtimeArrival : s.scheduledArrival)}${s.realtime ? '' : ' *'}</span>
+    </li>`).join('');
+    const note = times.some(s => !s.realtime) ? '<p class="muted">* aikataulun mukainen aika, ei reaaliaikaista ennustetta</p>' : '';
+    marker.setPopupContent(title + `<ul class="arrivals">${rows}</ul>` + note);
+  } catch (e) {
+    marker.setPopupContent(title + `<p class="muted">Haku epäonnistui: ${esc(e.message === 'KEY' ? 'palvelimen avain ei kelpaa' : e.message)}</p>`);
+  }
+}
+
+// ===================== KARTTA =====================
+function createMap() {
+  map = L.map('map', { preferCanvas: true, zoomControl: false }).setView(CENTER, 13);
+  L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+  // Taustakartta: OpenStreetMap
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '© OpenStreetMap-tekijät · Liikennedata © Digitransit 2026, Kajaanin kaupunki'
+  }).addTo(map);
+
+  linesLayer = L.layerGroup().addTo(map);
+  stopsLayer = L.layerGroup();
+  busLayer = L.layerGroup().addTo(map);
+
+  // Pysäkit näkyvät vasta, kun kartta on zoomattu tarpeeksi lähelle
+  const toggleStops = () => {
+    if (map.getZoom() >= STOPS_MIN_ZOOM) stopsLayer.addTo(map); else map.removeLayer(stopsLayer);
+  };
+  map.on('zoomend', toggleStops);
+  toggleStops();
+
+  // Bussien liukuanimaatio pois päältä zoomauksen ajaksi
+  map.on('zoomstart', () => map.getContainer().classList.add('zooming'));
+  map.on('zoomend', () => setTimeout(() => map.getContainer().classList.remove('zooming'), 80));
+  map.on('zoomend', () => { for (const b of buses.values()) styleBus(b); });
+}
+
+// ===================== KÄYNNISTYS =====================
+async function start() {
+  createMap();
+  setStatus('', 'Haetaan linjoja…');
+  try {
+    await loadRoutes();
+  } catch (e) {
+    setStatus('bad', 'Linjojen haku epäonnistui');
+    showToast(e.message === 'KEY'
+      ? 'Palvelimen API-avain puuttuu tai ei kelpaa.'
+      : 'Linjojen haku epäonnistui: ' + e.message);
+    return;
+  }
+  connectMqtt();
+  setInterval(removeStaleBuses, 15000);
+  setTimeout(() => { emptyHintDue = true; updateBusStatus(); }, 20000);
+}
+
+// Kapealla näytöllä linjalista on aluksi kiinni, jotta kartta näkyy
+if (window.innerWidth < 600) $('panel').open = false;
+
+start();
+</script>
+</body>
+</html>
