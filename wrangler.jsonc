@@ -1,0 +1,9 @@
+// Cloudflare Workerin asetukset
+{
+  "name": "kajaani-bussit",
+  "main": "src/index.js",
+  "compatibility_date": "2026-06-01",
+  "assets": { "directory": "./public" },
+  // Säilyttää Cloudflaren sivuilla asetetut muuttujat julkaisun yhteydessä
+  "keep_vars": true
+}
